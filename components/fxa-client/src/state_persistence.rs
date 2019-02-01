@@ -85,6 +85,8 @@ impl From<StateV1> for Result<StateV2> {
             refresh_token,
             scoped_keys: all_scoped_keys,
             device_id: None,
+            last_handled_command: None,
+            commands_data: HashMap::new(),
         })
     }
 }

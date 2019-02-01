@@ -4,7 +4,7 @@
 
 use dialoguer::Select;
 use text_io::*;
-use fxa_client::{Config, FirefoxAccount, PersistCallback, DeviceCreateInfo, DeviceType};
+use fxa_client::{Config, FirefoxAccount, PersistCallback, DeviceCreateInfo, DeviceType, TabReceivedCallback};
 use std::{collections::HashMap, fs, io::{Read, Write}, sync::{Arc, Mutex}, time, thread};
 use url::Url;
 
@@ -78,14 +78,14 @@ fn main() -> Result<(), failure::Error> {
     let mut acct = load_or_create_fxa_creds(cfg.clone())?;
 
     // Initialize the send tab command handler and register our callback.
-    // acct.init_send_tab(TabReceivedCallback::new(on_tab_received)).unwrap();
+    acct.init_send_tab(TabReceivedCallback::new(on_tab_received)).unwrap();
 
     let acct: Arc<Mutex<FirefoxAccount>> = Arc::new(Mutex::new(acct));
     {
       let acct = acct.clone();
       thread::spawn(move || {
         loop {
-            // acct.lock().unwrap().fetch_missed_remote_commands().is_ok(); // Ignore 404 errors for now.
+            acct.lock().unwrap().fetch_missed_remote_commands().is_ok(); // Ignore 404 errors for now.
             thread::sleep(time::Duration::from_secs(1));
         }
       });
@@ -103,33 +103,32 @@ fn main() -> Result<(), failure::Error> {
             0 => {
                 println!("Enter new display name:");
                 let new_name: String = read!("{}\n");
-                // Set instance display name
+                // Set device display name
                 acct.lock().unwrap().set_display_name(&new_name).unwrap();
                 println!("Display name set to: {}", new_name);
             }
             1 => {
-                unimplemented!("Not yet!");
-                // let instances = acct.lock().unwrap().get_devices().unwrap();
-                // let instances_names: Vec<String> = instances
-                //     .iter()
-                //     .map(|i| i.name.clone().unwrap_or(i.id.clone()))
-                //     .collect();
-                // let mut targets_menu = Select::new();
-                // targets_menu.default(0);
-                // let instances_names_refs: Vec<&str> =
-                //     instances_names.iter().map(|s| s.as_ref()).collect();
-                // targets_menu.items(&instances_names_refs);
-                // println!("Choose a send-tab target:");
-                // let selection = targets_menu.interact().unwrap();
-                // let target = instances.get(selection).unwrap();
+                let devices = acct.lock().unwrap().get_devices().unwrap();
+                let devices_names: Vec<String> = devices
+                    .iter()
+                    .map(|i| i.display_name.clone())
+                    .collect();
+                let mut targets_menu = Select::new();
+                targets_menu.default(0);
+                let devices_names_refs: Vec<&str> =
+                    devices_names.iter().map(|s| s.as_ref()).collect();
+                targets_menu.items(&devices_names_refs);
+                println!("Choose a send-tab target:");
+                let selection = targets_menu.interact().unwrap();
+                let target = devices.get(selection).unwrap();
 
-                // // Payload
-                // println!("Title:");
-                // let title: String = read!("{}\n");
-                // println!("URL:");
-                // let url: String = read!("{}\n");
-                // acct.lock().unwrap().send_tab(target, &title, &url).unwrap();
-                // println!("Tab sent!");
+                // Payload
+                println!("Title:");
+                let title: String = read!("{}\n");
+                println!("URL:");
+                let url: String = read!("{}\n");
+                acct.lock().unwrap().send_tab(target, &title, &url).unwrap();
+                println!("Tab sent!");
             }
             2 => ::std::process::exit(0),
             _ => panic!("Invalid choice!"),

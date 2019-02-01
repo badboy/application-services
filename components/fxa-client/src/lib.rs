@@ -2,15 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-pub use crate::{config::Config, http_client::{ProfileResponse as Profile, DeviceType}};
+pub use crate::{config::Config, http_client::{ProfileResponse as Profile, DeviceType, DeviceResponse}};
 use crate::{
     errors::*,
     http_client::{
-        Client, DeviceCreateRequest, DeviceCreateRequestBuilder, DeviceResponse,
-        DeviceUpdateRequest, DeviceUpdateRequestBuilder, PendingCommandsResponse, PushSubscription,
+        Client, DeviceCreateRequest, DeviceCreateRequestBuilder,
+        DeviceUpdateRequest, DeviceUpdateRequestBuilder, PendingCommand, PendingCommandsResponse, PushSubscription,
     },
     scoped_keys::ScopedKeysFlow,
     util::{now, random_base64_url_string},
+    commands::{CommandsHandler, send_tab::{SendTab, SendTabPayload}},
 };
 use lazy_static::lazy_static;
 use ring::{digest, rand::SystemRandom};
@@ -30,7 +31,9 @@ use {
     },
     std::mem,
 };
+pub use commands::send_tab::TabReceivedCallback;
 
+mod commands;
 mod config;
 pub mod errors;
 #[cfg(feature = "ffi")]
@@ -64,6 +67,10 @@ pub(crate) struct StateV2 {
     login_state: LoginState,
     refresh_token: Option<RefreshToken>,
     scoped_keys: HashMap<String, ScopedKey>,
+    last_handled_command: Option<u64>,
+    // Remove serde(default) once we are V3.
+    #[serde(default)]
+    commands_data: HashMap<String, String>,
     device_id: Option<String>,
 }
 
@@ -100,6 +107,7 @@ pub struct FirefoxAccount {
     flow_store: HashMap<String, OAuthFlow>,
     persist_callback: Option<PersistCallback>,
     profile_cache: Option<CachedResponse<Profile>>,
+    command_handlers: HashMap<String, Box<dyn CommandsHandler + 'static + Send + Sync>>,
 }
 
 pub struct SyncKeys(pub String, pub String);
@@ -131,6 +139,7 @@ impl FirefoxAccount {
             flow_store: HashMap::new(),
             persist_callback: None,
             profile_cache: None,
+            command_handlers: HashMap::new(),
         }
     }
 
@@ -142,6 +151,8 @@ impl FirefoxAccount {
             refresh_token: None,
             scoped_keys: HashMap::new(),
             device_id: None,
+            last_handled_command: None,
+            commands_data: HashMap::new(),
         })
     }
 
@@ -182,6 +193,7 @@ impl FirefoxAccount {
             refresh_token: None,
             scoped_keys: HashMap::new(),
             device_id: None,
+            last_handled_command: None,
         }))
     }
 
@@ -468,15 +480,16 @@ impl FirefoxAccount {
     }
 
     pub fn get_devices(&mut self) -> Result<Vec<DeviceResponse>> {
-        let access_token = self.get_access_token(scopes::DEVICES_READ)?.token;
+        let access_token = self.get_refresh_token()?;
+        // let access_token = self.get_access_token(scopes::DEVICES_READ)?.token;
         let client = Client::new(&self.state.config);
         client.devices(&access_token)
     }
 
-    pub fn fetch_pending_commands(
+    fn fetch_pending_commands(
         &self,
-        index: i64,
-        limit: Option<i64>,
+        index: u64,
+        limit: Option<u64>,
     ) -> Result<PendingCommandsResponse> {
         let refresh_token = self.get_refresh_token()?;
         let client = Client::new(&self.state.config);
@@ -486,12 +499,55 @@ impl FirefoxAccount {
     pub fn invoke_command(
         &mut self,
         command: &str,
-        target_device_id: &str,
+        target: &DeviceResponse,
         payload: &serde_json::Value,
     ) -> Result<()> {
-        let access_token = self.get_access_token(scopes::DEVICES_WRITE)?.token;
+        let access_token = self.get_refresh_token()?;
+        // let access_token = self.get_access_token(scopes::DEVICES_WRITE)?.token;
         let client = Client::new(&self.state.config);
-        client.invoke_command(&access_token, command, target_device_id, payload)
+        client.invoke_command(&access_token, command, &target.id, payload)
+    }
+
+    pub fn poll_remote_commands(&mut self) -> Result<()> {
+        let last_command_index = self.state.last_handled_command.unwrap_or(0);
+        // We increment last_command_index by 1 because the server response includes the current index.
+        let pending_commands = self.fetch_pending_commands(last_command_index + 1, None)?;
+        if pending_commands.messages.len() > 0 {
+            log::info!("Handling {} messages", pending_commands.messages.len());
+            self.handle_commands(pending_commands.messages)?;
+        }
+        self.state.last_handled_command = Some(pending_commands.index);
+        self.maybe_call_persist_callback();
+        Ok(())
+    }
+
+    fn handle_commands(&mut self, messages: Vec<PendingCommand>) -> Result<()> {
+        let commands: Vec<_> = messages.into_iter().map(|m| m.data).collect();
+        let devices = self.get_devices()?;
+        for data in commands {
+            let sender = data
+                .sender
+                .clone()
+                .and_then(|s| devices.iter().find(|i| i.id == s));
+            let command = data.command.as_str();
+            if let Some(handler) = self.command_handlers.get_mut(command) {
+                let local_data = self.state.commands_data.get(command).ok_or_else(|| {
+                    ErrorKind::IllegalState("Local data was not initialized".to_string())
+                })?;
+                handler.handle_command(local_data, sender, data.payload)?;
+            } else {
+                log::error!("Unknown command: {}", command)
+            }
+        }
+        Ok(())
+    }
+
+    fn register_command_handler(
+        &mut self,
+        command: &str,
+        handler: Box<CommandsHandler + Send + Sync>,
+    ) {
+        self.command_handlers.insert(command.to_string(), handler);
     }
 
     pub fn replace_device(&self, info: DeviceCreateInfo) -> Result<()> {
@@ -582,14 +638,10 @@ impl FirefoxAccount {
 
     fn maybe_call_persist_callback(&self) {
         if let Some(ref cb) = self.persist_callback {
-            let json = match self.to_json() {
-                Ok(json) => json,
-                Err(_) => {
-                    log::error!("Error with to_json in persist_callback");
-                    return;
-                }
+            match self.to_json() {
+                Ok(ref json) => cb.call(json),
+                Err(_) => log::error!("Error with to_json in persist_callback"),
             };
-            cb.call(&json);
         }
     }
 
@@ -598,6 +650,33 @@ impl FirefoxAccount {
         let client = Client::new(&self.state.config);
         client.sign_out();
         self.state.login_state = self.state.login_state.to_separated();
+    }
+
+    pub fn send_tab(&mut self, target: &DeviceResponse, title: &str, url: &str) -> Result<()> {
+        let command = SendTab::command_name();
+        let command_payload;
+        {
+            let send_tab = self.command_handlers.get(&command).unwrap();
+            let send_tab = send_tab.as_any().downcast_ref::<SendTab>().unwrap();
+            let payload = SendTabPayload::single_tab(title, url);
+            command_payload = send_tab.build_send_command(target, &payload).unwrap();
+        }
+        self.invoke_command(&command, target, &command_payload)
+    }
+
+    pub fn init_send_tab(&mut self, tab_received_callback: TabReceivedCallback) -> Result<()> {
+        let command = SendTab::command_name();
+        let oldsync_key = self.state.scoped_keys.get(scopes::OLD_SYNC).unwrap();
+        let ksync = base64::decode_config(&oldsync_key.k, base64::URL_SAFE_NO_PAD)?;
+        let kxcs: &str = oldsync_key.kid.splitn(2, '-').collect::<Vec<_>>()[1];
+        let kxcs = base64::decode_config(&kxcs, base64::URL_SAFE_NO_PAD)?;
+        let mut send_tab = SendTab::new(&ksync, &kxcs, tab_received_callback);
+        let (command_value, local_data) = send_tab.init(self.state.commands_data.get(&command).map(|s| s.as_str()))?;
+        self.register_command(&command, &command_value)?;
+        self.state.commands_data.insert(command.clone(), local_data);
+        self.maybe_call_persist_callback();
+        self.register_command_handler(&command, Box::new(send_tab));
+        Ok(())
     }
 }
 
@@ -653,6 +732,21 @@ impl From<DeviceCreateInfo> for DeviceCreateRequest {
         }
         builder.build()
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "command", content = "data")]
+pub enum PushPayload {
+    #[serde(rename = "fxaccounts:command_received")]
+    CommandReceived(CommandReceivedPushPayload),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommandReceivedPushPayload {
+    command: String,
+    index: u64,
+    sender: String,
+    url: String,
 }
 
 #[cfg(test)]
@@ -889,5 +983,11 @@ mod tests {
             "https://stable.dev.lcip.org/connect_another_device?showSuccessMessage=true"
                 .to_string()
         );
+    }
+
+    #[test]
+    fn test_deserialize_push_message() {
+        let json = "{\"version\":1,\"command\":\"fxaccounts:command_received\",\"data\":{\"command\":\"send-tab-recv\",\"index\":1,\"sender\":\"bobo\",\"url\":\"https://mozilla.org\"}}";
+        let _: PushPayload = serde_json::from_str(&json).unwrap();
     }
 }
