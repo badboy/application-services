@@ -84,7 +84,6 @@ impl From<StateV1> for Result<StateV2> {
             login_state: super::login_sm::LoginState::Unknown,
             refresh_token,
             scoped_keys: all_scoped_keys,
-            device_id: None,
             last_handled_command: None,
             commands_data: HashMap::new(),
         })
@@ -148,7 +147,6 @@ mod tests {
             .scopes
             .contains("https://identity.mozilla.com/apps/lockbox"));
         assert_eq!(state.scoped_keys.len(), 2);
-        assert!(state.device_id.is_none());
         let oldsync_key = state
             .scoped_keys
             .get("https://identity.mozilla.com/apps/oldsync")

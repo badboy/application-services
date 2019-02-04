@@ -3,19 +3,23 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use dialoguer::Select;
+use fxa_client::{Config, DeviceType, FirefoxAccount, PersistCallback, TabReceivedCallback};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Read, Write},
+    sync::{Arc, Mutex},
+    thread, time,
+};
 use text_io::*;
-use fxa_client::{Config, FirefoxAccount, PersistCallback, DeviceCreateInfo, DeviceType, TabReceivedCallback};
-use std::{collections::HashMap, fs, io::{Read, Write}, sync::{Arc, Mutex}, time, thread};
 use url::Url;
 
 static CREDENTIALS_PATH: &'static str = "credentials.json";
 static CONTENT_SERVER: &'static str = "https://devicesrefresh.dev.lcip.org";
 static CLIENT_ID: &'static str = "3c49430b43dfba77";
-static REDIRECT_URI: &'static str = "https://devicesrefresh.dev.lcip.org/oauth/success/3c49430b43dfba77";
-static SCOPES: &'static [&'static str] = &[
-    "profile",
-    "https://identity.mozilla.com/apps/oldsync",
-];
+static REDIRECT_URI: &'static str =
+    "https://devicesrefresh.dev.lcip.org/oauth/success/3c49430b43dfba77";
+static SCOPES: &'static [&'static str] = &["profile", "https://identity.mozilla.com/apps/oldsync"];
 static DEFAULT_DEVICE_NAME: &'static str = "Bobo device";
 
 fn load_fxa_creds() -> Result<FirefoxAccount, failure::Error> {
@@ -26,22 +30,19 @@ fn load_fxa_creds() -> Result<FirefoxAccount, failure::Error> {
 }
 
 fn load_or_create_fxa_creds(cfg: Config) -> Result<FirefoxAccount, failure::Error> {
-    let mut acct = load_fxa_creds()
-    .or_else(|_e| {
-        create_fxa_creds(cfg)
-    })?;
+    let mut acct = load_fxa_creds().or_else(|_e| create_fxa_creds(cfg))?;
     acct.register_persist_callback(PersistCallback::new(persist_fxa_state));
     Ok(acct)
 }
 
 fn persist_fxa_state(json: &str) {
     let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(CREDENTIALS_PATH)
-            .unwrap();
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(CREDENTIALS_PATH)
+        .unwrap();
     write!(file, "{}", json).unwrap();
     file.flush().unwrap();
 }
@@ -78,17 +79,18 @@ fn main() -> Result<(), failure::Error> {
     let mut acct = load_or_create_fxa_creds(cfg.clone())?;
 
     // Initialize the send tab command handler and register our callback.
-    acct.init_send_tab(TabReceivedCallback::new(on_tab_received)).unwrap();
+    acct.init_send_tab(TabReceivedCallback::new(on_tab_received))
+        .unwrap();
 
     let acct: Arc<Mutex<FirefoxAccount>> = Arc::new(Mutex::new(acct));
     {
-      let acct = acct.clone();
-      thread::spawn(move || {
-        loop {
-            acct.lock().unwrap().fetch_missed_remote_commands().is_ok(); // Ignore 404 errors for now.
-            thread::sleep(time::Duration::from_secs(1));
-        }
-      });
+        let acct = acct.clone();
+        thread::spawn(move || {
+            loop {
+                acct.lock().unwrap().fetch_missed_remote_commands().is_ok(); // Ignore 404 errors for now.
+                thread::sleep(time::Duration::from_secs(1));
+            }
+        });
     }
 
     // Menu:
@@ -109,10 +111,8 @@ fn main() -> Result<(), failure::Error> {
             }
             1 => {
                 let devices = acct.lock().unwrap().get_devices().unwrap();
-                let devices_names: Vec<String> = devices
-                    .iter()
-                    .map(|i| i.display_name.clone())
-                    .collect();
+                let devices_names: Vec<String> =
+                    devices.iter().map(|i| i.display_name.clone()).collect();
                 let mut targets_menu = Select::new();
                 targets_menu.default(0);
                 let devices_names_refs: Vec<&str> =

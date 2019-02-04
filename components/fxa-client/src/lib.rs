@@ -2,16 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-pub use crate::{config::Config, http_client::{ProfileResponse as Profile, DeviceType, DeviceResponse}};
 use crate::{
+    commands::send_tab::{
+        self, EncryptedSendTabPayload, PrivateSendTabKeys, PublicSendTabKeys, SendTabPayload,
+    },
     errors::*,
     http_client::{
-        Client, DeviceCreateRequest, DeviceCreateRequestBuilder,
-        DeviceUpdateRequest, DeviceUpdateRequestBuilder, PendingCommand, PendingCommandsResponse, PushSubscription,
+        Client, CommandData, DeviceUpdateRequest, DeviceUpdateRequestBuilder, PendingCommand,
+        PushSubscription,
     },
     scoped_keys::ScopedKeysFlow,
     util::{now, random_base64_url_string},
-    commands::{CommandsHandler, send_tab::{SendTab, SendTabPayload}},
+};
+pub use crate::{
+    config::Config,
+    http_client::{DeviceResponse, DeviceType, ProfileResponse as Profile},
 };
 use lazy_static::lazy_static;
 use ring::{digest, rand::SystemRandom};
@@ -31,7 +36,6 @@ use {
     },
     std::mem,
 };
-pub use commands::send_tab::TabReceivedCallback;
 
 mod commands;
 mod config;
@@ -71,7 +75,6 @@ pub(crate) struct StateV2 {
     // Remove serde(default) once we are V3.
     #[serde(default)]
     commands_data: HashMap<String, String>,
-    device_id: Option<String>,
 }
 
 #[cfg(feature = "browserid")]
@@ -107,7 +110,6 @@ pub struct FirefoxAccount {
     flow_store: HashMap<String, OAuthFlow>,
     persist_callback: Option<PersistCallback>,
     profile_cache: Option<CachedResponse<Profile>>,
-    command_handlers: HashMap<String, Box<dyn CommandsHandler + 'static + Send + Sync>>,
 }
 
 pub struct SyncKeys(pub String, pub String);
@@ -139,7 +141,6 @@ impl FirefoxAccount {
             flow_store: HashMap::new(),
             persist_callback: None,
             profile_cache: None,
-            command_handlers: HashMap::new(),
         }
     }
 
@@ -150,7 +151,6 @@ impl FirefoxAccount {
             login_state: Unknown,
             refresh_token: None,
             scoped_keys: HashMap::new(),
-            device_id: None,
             last_handled_command: None,
             commands_data: HashMap::new(),
         })
@@ -192,8 +192,8 @@ impl FirefoxAccount {
             login_state,
             refresh_token: None,
             scoped_keys: HashMap::new(),
-            device_id: None,
             last_handled_command: None,
+            commands_data: HashMap::new(),
         }))
     }
 
@@ -486,16 +486,6 @@ impl FirefoxAccount {
         client.devices(&access_token)
     }
 
-    fn fetch_pending_commands(
-        &self,
-        index: u64,
-        limit: Option<u64>,
-    ) -> Result<PendingCommandsResponse> {
-        let refresh_token = self.get_refresh_token()?;
-        let client = Client::new(&self.state.config);
-        client.pending_commands(refresh_token, index, limit)
-    }
-
     pub fn invoke_command(
         &mut self,
         command: &str,
@@ -508,69 +498,88 @@ impl FirefoxAccount {
         client.invoke_command(&access_token, command, &target.id, payload)
     }
 
-    pub fn poll_remote_commands(&mut self) -> Result<()> {
-        let last_command_index = self.state.last_handled_command.unwrap_or(0);
-        // We increment last_command_index by 1 because the server response includes the current index.
-        let pending_commands = self.fetch_pending_commands(last_command_index + 1, None)?;
-        if pending_commands.messages.len() > 0 {
-            log::info!("Handling {} messages", pending_commands.messages.len());
-            self.handle_commands(pending_commands.messages)?;
+    pub fn handle_push_message(&mut self, payload: PushPayload) -> Result<Vec<AccountEvent>> {
+        match payload {
+            PushPayload::CommandReceived(_) => self.poll_remote_commands(),
         }
-        self.state.last_handled_command = Some(pending_commands.index);
-        self.maybe_call_persist_callback();
-        Ok(())
     }
 
-    fn handle_commands(&mut self, messages: Vec<PendingCommand>) -> Result<()> {
+    pub fn poll_remote_commands(&mut self) -> Result<Vec<AccountEvent>> {
+        let last_command_index = self.state.last_handled_command.unwrap_or(0);
+        let refresh_token = self.get_refresh_token()?;
+        let client = Client::new(&self.state.config);
+        // We increment last_command_index by 1 because the server response includes the current index.
+        let pending_commands =
+            client.pending_commands(refresh_token, last_command_index + 1, None)?;
+        if pending_commands.messages.len() == 0 {
+            return Ok(Vec::new());
+        }
+        log::info!("Handling {} messages", pending_commands.messages.len());
+        let account_events = self.handle_commands(pending_commands.messages)?;
+        self.state.last_handled_command = Some(pending_commands.index);
+        self.maybe_call_persist_callback();
+        Ok(account_events)
+    }
+
+    // TODO: tests for that
+    fn handle_commands(&mut self, messages: Vec<PendingCommand>) -> Result<Vec<AccountEvent>> {
+        let mut account_events: Vec<AccountEvent> = Vec::with_capacity(messages.len());
         let commands: Vec<_> = messages.into_iter().map(|m| m.data).collect();
         let devices = self.get_devices()?;
         for data in commands {
-            let sender = data
-                .sender
-                .clone()
-                .and_then(|s| devices.iter().find(|i| i.id == s));
-            let command = data.command.as_str();
-            if let Some(handler) = self.command_handlers.get_mut(command) {
-                let local_data = self.state.commands_data.get(command).ok_or_else(|| {
-                    ErrorKind::IllegalState("Local data was not initialized".to_string())
-                })?;
-                handler.handle_command(local_data, sender, data.payload)?;
-            } else {
-                log::error!("Unknown command: {}", command)
-            }
+            match self.handle_command(data, &devices) {
+                Ok((sender, tab)) => account_events.push(AccountEvent::TabReceived((sender, tab))),
+                Err(e) => log::error!("Error while processing command: {}", e),
+            };
         }
-        Ok(())
+        Ok(account_events)
     }
 
-    fn register_command_handler(
+    // Returns EncryptedSendTabPayload for now because we only receive send-tab commands and
+    // it's way easier, but should probably return AccountEvent or similar in the future.
+    fn handle_command(
         &mut self,
-        command: &str,
-        handler: Box<CommandsHandler + Send + Sync>,
-    ) {
-        self.command_handlers.insert(command.to_string(), handler);
-    }
-
-    pub fn replace_device(&self, info: DeviceCreateInfo) -> Result<()> {
-        let refresh_token = self.get_refresh_token()?;
-        let client = Client::new(&self.state.config);
-        client.create_device(refresh_token, info.into())
+        command_data: CommandData,
+        devices: &[DeviceResponse],
+    ) -> Result<(Option<DeviceResponse>, SendTabPayload)> {
+        let sender = command_data
+            .sender
+            .and_then(|s| devices.iter().find(|i| i.id == s).map(|x| x.clone()));
+        match command_data.command.as_str() {
+            send_tab::COMMAND_NAME => {
+                let send_tab_key: PrivateSendTabKeys =
+                    match self.state.commands_data.get(send_tab::COMMAND_NAME) {
+                        Some(s) => serde_json::from_str(s)?,
+                        None => return Err(ErrorKind::IllegalState(
+                            "Cannot find send-tab keys. Has ensure_send_tab been called before?"
+                                .to_string(),
+                        )
+                        .into()),
+                    };
+                let encrypted_payload: EncryptedSendTabPayload =
+                    serde_json::from_value(command_data.payload)?;
+                Ok((sender, encrypted_payload.decrypt(&send_tab_key)?))
+            }
+            _ => Err(ErrorKind::UnknownCommand(command_data.command).into()),
+        }
     }
 
     pub fn set_push_subscription(&self, push_subscription: PushSubscription) -> Result<()> {
-        let update = self
-            .make_update_builder()?
+        let update = DeviceUpdateRequestBuilder::new()
             .push_subscription(push_subscription)
             .build();
         self.update_device(update)
     }
 
     pub fn set_display_name(&self, name: &str) -> Result<()> {
-        let update = self.make_update_builder()?.display_name(name).build();
+        let update = DeviceUpdateRequestBuilder::new().display_name(name).build();
         self.update_device(update)
     }
 
     pub fn clear_display_name(&self) -> Result<()> {
-        let update = self.make_update_builder()?.clear_display_name().build();
+        let update = DeviceUpdateRequestBuilder::new()
+            .clear_display_name()
+            .build();
         self.update_device(update)
     }
 
@@ -578,8 +587,7 @@ impl FirefoxAccount {
     pub fn register_command(&self, command: &str, value: &str) -> Result<()> {
         let mut commands = HashMap::new();
         commands.insert(command.to_owned(), value.to_owned());
-        let update = self
-            .make_update_builder()?
+        let update = DeviceUpdateRequestBuilder::new()
             .available_commands(commands)
             .build();
         self.update_device(update)
@@ -588,24 +596,17 @@ impl FirefoxAccount {
     // TODO: this currently deletes every command registered.
     pub fn unregister_command(&self, _: &str) -> Result<()> {
         let commands = HashMap::new();
-        let update = self
-            .make_update_builder()?
+        let update = DeviceUpdateRequestBuilder::new()
             .available_commands(commands)
             .build();
         self.update_device(update)
     }
 
     pub fn clear_commands(&self) -> Result<()> {
-        let update = self
-            .make_update_builder()?
+        let update = DeviceUpdateRequestBuilder::new()
             .clear_available_commands()
             .build();
         self.update_device(update)
-    }
-
-    fn make_update_builder(&self) -> Result<DeviceUpdateRequestBuilder> {
-        // let device_id = self.ensure_device_id()?;
-        Ok(DeviceUpdateRequestBuilder::new(/*device_id*/))
     }
 
     fn update_device(&self, update: DeviceUpdateRequest) -> Result<()> {
@@ -621,10 +622,10 @@ impl FirefoxAccount {
         }
     }
 
-    fn ensure_device_id(&self) -> Result<&str> {
-        match self.state.device_id {
-            Some(ref id) => Ok(id),
-            None => Err(ErrorKind::DeviceUnregistered.into()),
+    fn get_scoped_key(&self, scope: &str) -> Result<&ScopedKey> {
+        match self.state.scoped_keys.get(scope) {
+            Some(ref scoped_key) => Ok(scoped_key),
+            None => Err(ErrorKind::NoCachedKey(scope.to_string()).into()),
         }
     }
 
@@ -653,31 +654,47 @@ impl FirefoxAccount {
     }
 
     pub fn send_tab(&mut self, target: &DeviceResponse, title: &str, url: &str) -> Result<()> {
-        let command = SendTab::command_name();
-        let command_payload;
-        {
-            let send_tab = self.command_handlers.get(&command).unwrap();
-            let send_tab = send_tab.as_any().downcast_ref::<SendTab>().unwrap();
-            let payload = SendTabPayload::single_tab(title, url);
-            command_payload = send_tab.build_send_command(target, &payload).unwrap();
-        }
-        self.invoke_command(&command, target, &command_payload)
+        let payload = SendTabPayload::single_tab(title, url);
+        let kek = self.sync_keys_as_send_tab_kek()?;
+        let command_payload = send_tab::build_send_command(&kek, target, &payload)?;
+        self.invoke_command(send_tab::COMMAND_NAME, target, &command_payload)
     }
 
-    pub fn init_send_tab(&mut self, tab_received_callback: TabReceivedCallback) -> Result<()> {
-        let command = SendTab::command_name();
-        let oldsync_key = self.state.scoped_keys.get(scopes::OLD_SYNC).unwrap();
+    pub fn ensure_send_tab_registered(&mut self) -> Result<()> {
+        let own_keys: PrivateSendTabKeys =
+            match self.state.commands_data.get(send_tab::COMMAND_NAME) {
+                Some(s) => serde_json::from_str(s)?,
+                None => {
+                    let keys = PrivateSendTabKeys::from_random(&*RNG)?;
+                    self.state.commands_data.insert(
+                        send_tab::COMMAND_NAME.to_owned(),
+                        serde_json::to_string(&keys)?,
+                    );
+                    self.maybe_call_persist_callback();
+                    keys
+                }
+            };
+        let public_keys: PublicSendTabKeys = own_keys.into();
+        let kek = self.sync_keys_as_send_tab_kek()?;
+        let command_data: String = public_keys.as_command_data(&kek)?;
+        self.register_command(send_tab::COMMAND_NAME, &command_data)?;
+        Ok(())
+    }
+
+    fn sync_keys_as_send_tab_kek(&self) -> Result<send_tab::KeyEncryptingKey> {
+        let oldsync_key = self.get_scoped_key(scopes::OLD_SYNC)?;
         let ksync = base64::decode_config(&oldsync_key.k, base64::URL_SAFE_NO_PAD)?;
         let kxcs: &str = oldsync_key.kid.splitn(2, '-').collect::<Vec<_>>()[1];
         let kxcs = base64::decode_config(&kxcs, base64::URL_SAFE_NO_PAD)?;
-        let mut send_tab = SendTab::new(&ksync, &kxcs, tab_received_callback);
-        let (command_value, local_data) = send_tab.init(self.state.commands_data.get(&command).map(|s| s.as_str()))?;
-        self.register_command(&command, &command_value)?;
-        self.state.commands_data.insert(command.clone(), local_data);
-        self.maybe_call_persist_callback();
-        self.register_command_handler(&command, Box::new(send_tab));
-        Ok(())
+        Ok(send_tab::KeyEncryptingKey::SyncKeys(ksync, kxcs))
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum AccountEvent {
+    // In the future: ProfileUpdated etc.
+    TabReceived((Option<DeviceResponse>, SendTabPayload)),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -712,26 +729,6 @@ pub struct AccessTokenInfo {
     pub token: String,
     pub key: Option<ScopedKey>,
     pub expires_at: u64, // seconds since epoch
-}
-
-pub struct DeviceCreateInfo {
-    pub device_type: DeviceType,
-    pub display_name: String,
-    pub push_subscription: Option<PushSubscription>,
-    pub available_commands: Option<HashMap<String, String>>,
-}
-
-impl From<DeviceCreateInfo> for DeviceCreateRequest {
-    fn from(info: DeviceCreateInfo) -> Self {
-        let mut builder = DeviceCreateRequestBuilder::new(&info.display_name, info.device_type);
-        if let Some(push_subscription) = info.push_subscription {
-            builder = builder.push_subscription(push_subscription)
-        }
-        if let Some(available_commands) = info.available_commands {
-            builder = builder.available_commands(available_commands)
-        }
-        builder.build()
-    }
 }
 
 #[derive(Debug, Deserialize)]

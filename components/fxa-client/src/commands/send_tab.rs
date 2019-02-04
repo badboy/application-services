@@ -2,39 +2,31 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use super::CommandsHandler;
-use ece::{
-    Aes128GcmEceWebPushImpl, LocalKeyPairImpl, LocalKeyPair, RemoteKeyPairImpl, WebPushParams,
-};
 use crate::errors::*;
-use serde_derive::*;
-use hex;
-use ring::rand::{SecureRandom, SystemRandom};
-use std::panic::RefUnwindSafe;
-use sync15::KeyBundle;
 use crate::DeviceResponse;
+use ece::{
+    Aes128GcmEceWebPushImpl, LocalKeyPair, LocalKeyPairImpl, RemoteKeyPairImpl, WebPushParams,
+};
+use hex;
+use ring::rand::SecureRandom;
+use serde_derive::*;
+use sync15::KeyBundle;
 
-const COMMAND_SEND_TAB: &'static str = "https://identity.mozilla.com/cmd/open-uri";
+pub const COMMAND_NAME: &'static str = "https://identity.mozilla.com/cmd/open-uri";
 
-pub struct SendTab {
-    ksync: Vec<u8>,
-    kxcs: Vec<u8>,
-    tab_received_callback: TabReceivedCallback,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedSendTabPayload {
     /// URL Safe Base 64 encrypted send-tab payload.
     encrypted: String,
 }
 
 impl EncryptedSendTabPayload {
-    fn decrypt(self, keys: &SendTabKeysInternal) -> Result<SendTabPayload> {
-        let encrypted = base64::decode_config(&self.encrypted, base64::URL_SAFE_NO_PAD).unwrap();
-        let private_key = LocalKeyPairImpl::new(&keys.private_key).unwrap();
+    pub fn decrypt(self, keys: &PrivateSendTabKeys) -> Result<SendTabPayload> {
+        let encrypted = base64::decode_config(&self.encrypted, base64::URL_SAFE_NO_PAD)?;
+        let private_key = LocalKeyPairImpl::new(&keys.private_key)?;
         let decrypted =
-            Aes128GcmEceWebPushImpl::decrypt(&private_key, &keys.auth_secret, &encrypted).unwrap();
-        Ok(serde_json::from_slice(&decrypted).unwrap())
+            Aes128GcmEceWebPushImpl::decrypt(&private_key, &keys.auth_secret, &encrypted)?;
+        Ok(serde_json::from_slice(&decrypted)?)
     }
 }
 
@@ -52,20 +44,17 @@ impl SendTabPayload {
             }],
         }
     }
-    fn encrypt(&self, keys: SendTabKeysPublic) -> Result<EncryptedSendTabPayload> {
-        // TODO: unwraps
+    fn encrypt(&self, keys: PublicSendTabKeys) -> Result<EncryptedSendTabPayload> {
         let bytes = serde_json::to_vec(&self)?;
-        let public_key = base64::decode_config(&keys.public_key, base64::URL_SAFE_NO_PAD).unwrap();
+        let public_key = base64::decode_config(&keys.public_key, base64::URL_SAFE_NO_PAD)?;
         let public_key = RemoteKeyPairImpl::from_raw(&public_key);
-        let auth_secret =
-            base64::decode_config(&keys.auth_secret, base64::URL_SAFE_NO_PAD).unwrap();
+        let auth_secret = base64::decode_config(&keys.auth_secret, base64::URL_SAFE_NO_PAD)?;
         let encrypted = Aes128GcmEceWebPushImpl::encrypt(
             &public_key,
             &auth_secret,
             &bytes,
             WebPushParams::default(),
-        )
-        .unwrap();
+        )?;
         let encrypted = base64::encode_config(&encrypted, base64::URL_SAFE_NO_PAD);
         Ok(EncryptedSendTabPayload { encrypted })
     }
@@ -78,24 +67,25 @@ pub struct TabData {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct SendTabKeysInternal {
+pub struct PrivateSendTabKeys {
     public_key: Vec<u8>,
     private_key: Vec<u8>,
     auth_secret: Vec<u8>,
 }
 
-impl SendTabKeysInternal {
-    fn from_random() -> Self {
-        let key_pair = LocalKeyPairImpl::generate_random().unwrap(); // TODO: unwrap :(
+impl PrivateSendTabKeys {
+    pub fn from_random(rng: &SecureRandom) -> Result<Self> {
+        let key_pair = LocalKeyPairImpl::generate_random()?;
         let private_key = key_pair.to_raw();
-        let public_key = key_pair.pub_as_raw().unwrap();
+        let public_key = key_pair.pub_as_raw()?;
         let mut auth_secret = vec![0u8; 16];
-        SystemRandom::new().fill(&mut auth_secret).unwrap();
-        Self {
+        rng.fill(&mut auth_secret)
+            .map_err(|_| ErrorKind::RngFailure)?;
+        Ok(Self {
             public_key,
             private_key,
             auth_secret,
-        }
+        })
     }
 }
 
@@ -113,7 +103,7 @@ struct SendTabKeysPayload {
 }
 
 impl SendTabKeysPayload {
-    fn decrypt(self, ksync: &[u8], kxcs: &[u8]) -> Result<SendTabKeysPublic> {
+    fn decrypt(self, ksync: &[u8], kxcs: &[u8]) -> Result<PublicSendTabKeys> {
         // Most of the code here is copied from `EncryptedBso::decrypt`:
         // we can't use that method as-it because `EncryptedBso` forces
         // a payload id to be specified, which in turns make the Firefox
@@ -121,20 +111,19 @@ impl SendTabKeysPayload {
         if hex::decode(self.kid)? != kxcs {
             return Err(ErrorKind::MismatchedKeys.into());
         }
-        let key = KeyBundle::from_ksync_bytes(ksync)
-            .map_err(|_| ErrorKind::SyncError("Error importing ksync"))?;
-        if !key.verify_hmac_string(&self.hmac, &self.ciphertext).unwrap() {
+        let key = KeyBundle::from_ksync_bytes(ksync)?;
+        if !key.verify_hmac_string(&self.hmac, &self.ciphertext)? {
             return Err(ErrorKind::HmacMismatch.into());
         }
         let iv = base64::decode(&self.iv)?;
         let ciphertext = base64::decode(&self.ciphertext)?;
-        let cleartext = key.decrypt(&ciphertext, &iv).unwrap();
+        let cleartext = key.decrypt(&ciphertext, &iv)?;
         Ok(serde_json::from_str(&cleartext)?)
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct SendTabKeysPublic {
+pub struct PublicSendTabKeys {
     /// URL Safe Base 64 encoded push public key.
     #[serde(rename = "publicKey")]
     public_key: String,
@@ -143,19 +132,18 @@ struct SendTabKeysPublic {
     auth_secret: String,
 }
 
-impl SendTabKeysPublic {
-    fn encrypt(self, ksync: &[u8], kxcs: &[u8]) -> Result<SendTabKeysPayload> {
+impl PublicSendTabKeys {
+    fn encrypt(&self, ksync: &[u8], kxcs: &[u8]) -> Result<SendTabKeysPayload> {
         // Most of the code here is copied from `CleartextBso::encrypt`:
         // we can't use that method as-it because `CleartextBso` forces
         // a payload id to be specified, which in turns make the Firefox
         // Desktop commands implementation angry.
-        let key = KeyBundle::from_ksync_bytes(ksync)
-            .map_err(|_| ErrorKind::SyncError("Error importing ksync"))?;
+        let key = KeyBundle::from_ksync_bytes(ksync)?;
         let cleartext = serde_json::to_vec(&self)?;
-        let (enc_bytes, iv) = key.encrypt_bytes_rand_iv(&cleartext).unwrap(); // TODO: unwrap :/
+        let (enc_bytes, iv) = key.encrypt_bytes_rand_iv(&cleartext)?;
         let iv_base64 = base64::encode(&iv);
         let enc_base64 = base64::encode(&enc_bytes);
-        let hmac = key.hmac_string(enc_base64.as_bytes()).unwrap();
+        let hmac = key.hmac_string(enc_base64.as_bytes())?;
         Ok(SendTabKeysPayload {
             kid: hex::encode(kxcs),
             iv: iv_base64,
@@ -163,10 +151,17 @@ impl SendTabKeysPublic {
             ciphertext: enc_base64,
         })
     }
+    pub fn as_command_data(&self, kek: &KeyEncryptingKey) -> Result<String> {
+        let (ksync, kxcs) = match kek {
+            KeyEncryptingKey::SyncKeys(ksync, kxcs) => (ksync, kxcs),
+        };
+        let encrypted_public_keys = self.encrypt(&ksync, &kxcs)?;
+        Ok(serde_json::to_string(&encrypted_public_keys)?)
+    }
 }
 
-impl From<SendTabKeysInternal> for SendTabKeysPublic {
-    fn from(internal: SendTabKeysInternal) -> Self {
+impl From<PrivateSendTabKeys> for PublicSendTabKeys {
+    fn from(internal: PrivateSendTabKeys) -> Self {
         Self {
             public_key: base64::encode_config(&internal.public_key, base64::URL_SAFE_NO_PAD),
             auth_secret: base64::encode_config(&internal.auth_secret, base64::URL_SAFE_NO_PAD),
@@ -174,82 +169,25 @@ impl From<SendTabKeysInternal> for SendTabKeysPublic {
     }
 }
 
-impl SendTab {
-    pub fn new(ksync: &[u8], kxcs: &[u8], tab_received_callback: TabReceivedCallback) -> Self {
-        Self {
-            ksync: ksync.to_vec(),
-            kxcs: kxcs.to_vec(),
-            tab_received_callback,
-        }
-    }
-
-    pub fn build_send_command(
-        &self,
-        target: &DeviceResponse,
-        send_tab_payload: &SendTabPayload,
-    ) -> Result<serde_json::Value> {
-        let command = target
-            .available_commands
-            .get(COMMAND_SEND_TAB)
-            .ok_or_else(|| ErrorKind::UnsupportedCommand("Send Tab"))?;
-        let bundle: SendTabKeysPayload = serde_json::from_str(command)?;
-        let public_keys = bundle.decrypt(&self.ksync, &self.kxcs)?;
-        let encrypted_payload = send_tab_payload.encrypt(public_keys)?;
-        Ok(serde_json::to_value(&encrypted_payload)?)
-    }
+pub enum KeyEncryptingKey {
+    /// <ksync, kxcs>
+    SyncKeys(Vec<u8>, Vec<u8>),
 }
 
-impl CommandsHandler for SendTab {
-    fn command_name() -> String {
-        COMMAND_SEND_TAB.to_string()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn init(&mut self, local_data: Option<&str>) -> Result<(String, String)> {
-        let send_tab_keys: SendTabKeysInternal = local_data
-            .map(|s| serde_json::from_str(s))
-            .unwrap_or_else(|| Ok(SendTabKeysInternal::from_random()))?;
-        let send_tab_keys_public: SendTabKeysPublic = send_tab_keys.clone().into();
-        let encrypted_public_keys = send_tab_keys_public.encrypt(&self.ksync, &self.kxcs)?;
-        let command_data = serde_json::to_string(&encrypted_public_keys)?;
-        Ok((command_data, serde_json::to_string(&send_tab_keys)?))
-    }
-
-    fn handle_command(
-        &mut self,
-        local_data: &str,
-        sender: Option<&DeviceResponse>,
-        payload: serde_json::Value,
-    ) -> Result<()> {
-        let own_keys: SendTabKeysInternal = serde_json::from_str(local_data)?;
-        let payload: EncryptedSendTabPayload = serde_json::from_value(payload)?;
-        let decrypted = payload.decrypt(&own_keys)?;
-        for tab in decrypted.entries {
-            self.tab_received_callback.call(&tab.title, &tab.url);
-        }
-        Ok(())
-    }
-}
-
-pub struct TabReceivedCallback {
-    callback_fn: Box<Fn(&str, &str) + Sync + Send + RefUnwindSafe>,
-}
-
-impl TabReceivedCallback {
-    pub fn new<F>(callback_fn: F) -> Self
-    where
-        F: Fn(&str, &str) + 'static + Sync + Send + RefUnwindSafe,
-    {
-        Self {
-            callback_fn: Box::new(callback_fn),
-        }
-    }
-
-    // TODO: add sender (send device record or name?)
-    pub fn call(&self, title: &str, url: &str) {
-        (*self.callback_fn)(title, url);
-    }
+pub fn build_send_command(
+    kek: &KeyEncryptingKey,
+    target: &DeviceResponse,
+    send_tab_payload: &SendTabPayload,
+) -> Result<serde_json::Value> {
+    let (ksync, kxcs) = match kek {
+        KeyEncryptingKey::SyncKeys(ksync, kxcs) => (ksync, kxcs),
+    };
+    let command = target
+        .available_commands
+        .get(COMMAND_NAME)
+        .ok_or_else(|| ErrorKind::UnsupportedCommand("Send Tab"))?;
+    let bundle: SendTabKeysPayload = serde_json::from_str(command)?;
+    let public_keys = bundle.decrypt(&ksync, &kxcs)?;
+    let encrypted_payload = send_tab_payload.encrypt(public_keys)?;
+    Ok(serde_json::to_value(&encrypted_payload)?)
 }
