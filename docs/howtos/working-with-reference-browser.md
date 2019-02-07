@@ -39,6 +39,7 @@ rust.targets=x86
 In `android-components/local.properties`:
 ```groovy
 substitutions.application-services.dir=../application-services
+```
 
 In `reference-browser/local.properties`:
 ```groovy
