@@ -9,7 +9,7 @@
  *   2. Run `make cbindgen`
  */
 
-
+#pragma once
 
 #include <stdarg.h>
 #include <stdbool.h>
