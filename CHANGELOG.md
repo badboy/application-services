@@ -15,6 +15,16 @@
 ### What's changed
   - `CLIENTS_TTL` has been updated to be 180 days instead of 21 ([#5054](https://github.com/mozilla/application-services/pull/5054))
 
+# v93.7.2 (_2022-08-01_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v93.7.1...v93.7.2)
+
+## General
+
+### What's Changed
+
+* Glean updated to v50.1.4
+
 # v93.7.1 (_2022-07-26_)
 
 [Full Changelog](https://github.com/mozilla/application-services/compare/v93.7.0...v93.7.1)
@@ -70,6 +80,16 @@
 ## UniFFI
 ### What's Changed
   - Updated to UniFFI 0.19.3
+
+# v93.5.1 (_2022-08-01_)
+
+[Full Changelog](https://github.com/mozilla/application-services/compare/v93.5.0...v93.5.1)
+
+## General
+
+### What's Changed
+
+* Glean updated to v50.1.4
 
 # v93.5.0 (_2022-06-16_)
 
