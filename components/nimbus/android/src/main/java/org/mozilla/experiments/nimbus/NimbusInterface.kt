@@ -314,6 +314,8 @@ interface NimbusEventStore {
             NimbusEvents.isReady.record()
         }
     }
+
+    fun unblockMetricsScope() = Unit
 }
 
 class NullNimbus(override val context: Context) : NimbusInterface

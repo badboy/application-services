@@ -59,6 +59,12 @@ data class NimbusServerSettings(
     val collection: String = EXPERIMENT_COLLECTION_NAME,
 )
 
+@Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+private fun Any.wait() = (this as java.lang.Object).wait()
+
+@Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+private fun Any.notify() = (this as java.lang.Object).notify()
+
 /**
  * A implementation of the [NimbusInterface] interface backed by the Nimbus SDK.
  */
@@ -83,6 +89,8 @@ open class Nimbus(
     private val updateScope: CoroutineScope? = delegate.updateScope
 
     private val metricsScope: CoroutineScope = delegate.metricsScope
+
+    private val metricsScopeLock: Any = Any()
 
     private val errorReporter = delegate.errorReporter
 
@@ -177,6 +185,12 @@ open class Nimbus(
             )
         }
 
+        metricsScope.launch {
+            synchronized(metricsScopeLock) {
+                metricsScopeLock.wait()
+            }
+        }
+
         nimbusClient = NimbusClient(
             experimentContext,
             recordedContext,
@@ -185,6 +199,21 @@ open class Nimbus(
             remoteSettingsConfig,
             metricsHandler,
         )
+    }
+
+    override fun recordIsReady(count: Int) {
+        metricsScope.launch {
+            @Suppress("unused")
+            for (i in 1..count) {
+                NimbusEvents.isReady.record()
+            }
+        }
+    }
+
+    override fun unblockMetricsScope() {
+        synchronized(metricsScopeLock) {
+            metricsScopeLock.notify()
+        }
     }
 
     // This is currently not available from the main thread.
