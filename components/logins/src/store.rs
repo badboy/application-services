@@ -16,6 +16,11 @@ use sync15::{
     ServerTimestamp,
 };
 
+use error_support::debug;
+
+use glean_sys::metrics::CounterMetric;
+use glean_sys::types::{CommonMetricData, Lifetime};
+
 #[derive(uniffi::Enum)]
 pub enum LoginOrErrorMessage {
     Login,
@@ -84,6 +89,18 @@ pub struct LoginStore {
 impl LoginStore {
     #[handle_error(Error)]
     pub fn new(path: impl AsRef<Path>, encdec: Arc<dyn EncryptorDecryptor>) -> ApiResult<Self> {
+        debug!("new LoginStore! Recording a metric");
+        let cmd = CommonMetricData {
+            category: "dylib".to_string(),
+            name: "counting".to_string(),
+            send_in_pings: vec!["baseline".to_string(), "metrics".to_string()],
+            lifetime: Lifetime::Ping,
+            disabled: false,
+            dynamic_label: None,
+        };
+        let metric = CounterMetric::new(cmd);
+        metric.add(31);
+        debug!("Metric recorded.");
         let db = Mutex::new(Some(LoginDb::open(path, encdec)?));
         Ok(Self { db })
     }

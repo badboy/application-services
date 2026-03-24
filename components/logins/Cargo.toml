@@ -32,6 +32,7 @@ anyhow = "1.0"
 uniffi = { version = "0.31" }
 async-trait = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true, features = ["executor"] }
+glean-sys = { git = "https://github.com/mozilla/glean", branch = "glean-sys-generated" }
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
