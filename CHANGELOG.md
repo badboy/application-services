@@ -36,12 +36,15 @@ In the cases where the failed before, they're now no-ops.
 
 ### Remote Settings
 - Replacing v1 routes with v2 routes, removing added v2 routes ([#7492](https://github.com/mozilla/application-services/pull/7339))
-- Verify signature of imported data when `.get()` is called with `sync_if_empty: true` ([#7518](https://github.com/mozilla/application-services/pull/7518)) 
+- Verify signature of imported data when `.get()` is called with `sync_if_empty: true` ([#7518](https://github.com/mozilla/application-services/pull/7518))
 - Do not quote `_since` values with the v2 API ([#7523](https://github.com/mozilla/application-services/pull/7523))
 
 ### Sync Manager
 
 - `SyncManager::sync()` now fails immediately with a new `SyncManagerError::Busy` when a sync is already in progress, instead of blocking until it finishes.
+
+### Glean
+- Updated to v70.0.0 ([#TODO](https://github.com/mozilla/application-services/issues/TODO))
 
 ## 🔧 What's Fixed 🔧
 

@@ -1825,15 +1825,16 @@ checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 [[package]]
 name = "glean-build"
 version = "20.1.0"
-source = "git+https://github.com/mozilla/glean?rev=96644e4d5f1afca76f2b2bb2cadd5048323dcee4#96644e4d5f1afca76f2b2bb2cadd5048323dcee4"
+source = "git+https://github.com/mozilla/glean?tag=v70.0.0#915e1a5842103b90ac20cac25b3c97f7d424dd0c"
 dependencies = [
  "xshell-venv",
 ]
 
 [[package]]
 name = "glean-sym"
-version = "69.0.0"
-source = "git+https://github.com/mozilla/glean?rev=96644e4d5f1afca76f2b2bb2cadd5048323dcee4#96644e4d5f1afca76f2b2bb2cadd5048323dcee4"
+version = "70.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70cc5427a3840e10244e1af55ffe90b11258c99ae0371d64986855bd64ffae98"
 dependencies = [
  "libloading",
  "once_cell",
