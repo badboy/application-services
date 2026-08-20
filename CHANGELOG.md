@@ -59,6 +59,9 @@ In the cases where the failed before, they're now no-ops.
 
 - `SyncManager::sync()` now fails immediately with a new `SyncManagerError::Busy` when a sync is already in progress, instead of blocking until it finishes.
 
+### Glean
+- Updated to v70.0.0 ([#TODO](https://github.com/mozilla/application-services/issues/TODO))
+
 ## 🔧 What's Fixed 🔧
 
 ### Logins
