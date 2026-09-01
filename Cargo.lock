@@ -2696,6 +2696,7 @@ dependencies = [
  "crashtest",
  "error-support",
  "fxa-client",
+ "glean-sym",
  "init_rust_components",
  "logins",
  "merino",
